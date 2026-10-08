@@ -18,6 +18,7 @@ import folder_paths
 from comfy_api.latest import io
 
 from ..py.refmod_common import (
+    ON_FLOYO,
     list_image_files,
     refmods_dir,
 )
@@ -173,15 +174,31 @@ def _sanitize_name(name: str) -> str:
     return name
 
 
+def _inside_floyo_inputs(path: str) -> bool:
+    """A Floyo run holds the team's own files only under input/#inputs (and #community_inputs)."""
+    real = os.path.realpath(path)
+    for name in ("#inputs", "#community_inputs"):
+        root = os.path.realpath(os.path.join(folder_paths.get_input_directory(), name))
+        if real == root or real.startswith(root + os.sep):
+            return True
+    return False
+
+
 def _resolve_folder(folder: str) -> str:
     """Resolve a folder input: absolute path, a name inside input/, or input/ itself."""
     folder = (folder or "").strip().strip('"')
     if not folder:
         return folder_paths.get_input_directory()
+    if ON_FLOYO and folder.startswith("input/#"):
+        folder = folder[len("input/"):]
     if os.path.isabs(folder):
         resolved = os.path.normpath(folder)
     else:
         resolved = os.path.join(folder_paths.get_input_directory(), folder)
+    if ON_FLOYO and not _inside_floyo_inputs(resolved):
+        raise ValueError(
+            f"folder {folder!r}: on Floyo use a folder from My Files > inputs, "
+            "for example '#inputs/<folder>'.")
     if not os.path.isdir(resolved):
         raise ValueError(
             f"folder not found: {folder!r} (looked at '{resolved}'; use an "
@@ -303,11 +320,11 @@ def _choose_thumb_source(images: List[str]) -> Optional[str]:
     return ranked[0][3]
 
 
-def _copy_refmod_thumbnail(images: List[str], path_no_ext: str) -> None:
+def _copy_refmod_thumbnail(images: List[str], path_no_ext: str) -> Optional[str]:
     """Copy a representative source image beside the saved RefMod."""
     thumb_src = _choose_thumb_source(images)
     if not thumb_src:
-        return
+        return None
     ext = os.path.splitext(thumb_src)[1].lower()
     thumb_base = path_no_ext
     if thumb_base.lower().endswith(VISUAL_SUFFIX.lower()):
@@ -315,6 +332,7 @@ def _copy_refmod_thumbnail(images: List[str], path_no_ext: str) -> None:
     thumb_dst = thumb_base + ext
     shutil.copy2(thumb_src, thumb_dst)
     print(f"[H3RefModCreateFromFolder] thumbnail {os.path.basename(thumb_src)} -> {thumb_dst}")
+    return thumb_dst
 
 
 def _latent_token_count(latent: torch.Tensor) -> int:
@@ -324,7 +342,11 @@ def _latent_token_count(latent: torch.Tensor) -> int:
 def _resolve_output_dir(subfolder: str = "") -> str:
     base = refmods_dir()
     subfolder = str(subfolder or "").strip().strip('"').strip("/\\")
-    return os.path.join(base, subfolder) if subfolder else base
+    out_dir = os.path.join(base, subfolder) if subfolder else base
+    real_base, real_out = os.path.realpath(base), os.path.realpath(out_dir)
+    if ON_FLOYO and real_out != real_base and not real_out.startswith(real_base + os.sep):
+        raise ValueError(f"subfolder {subfolder!r} must stay inside the RefMods folder.")
+    return out_dir
 
 
 def _base_refmod_name(name: str) -> str:
@@ -641,6 +663,7 @@ def _create_mod_from_folder(
     motion_only: bool = False,
     extraction_preset: str = "manual",
     include_images: bool = False,
+    saved: Optional[List[str]] = None,
 ) -> List[Tuple[H3RefMod, float]]:
     """Create refs from one folder and optionally save them as split files or one bundle."""
     if budget_policy not in ("truncate", "error"):
@@ -903,22 +926,30 @@ def _create_mod_from_folder(
     if save:
         if save_layout == "bundle":
             destination = save_refmod_bundle(bundle_path_no_ext, bundle_name, [mod for mod, _ in rows])
-            _copy_refmod_thumbnail(images, bundle_path_no_ext)
+            thumb = _copy_refmod_thumbnail(images, bundle_path_no_ext)
+            if saved is not None:
+                saved += [destination] + ([thumb] if thumb else [])
             _MOD_CACHE[bundle_name] = tuple(mod for mod, _ in rows)
             print(f"[CreateH3RefMod] saved bundle '{bundle_name}' with {len(rows)} member(s) -> {destination}")
         else:
             if visual_mod is not None:
                 visual_path = visual_mod.save(visual_path_no_ext)
-                _copy_refmod_thumbnail(images, visual_path_no_ext)
+                thumb = _copy_refmod_thumbnail(images, visual_path_no_ext)
+                if saved is not None:
+                    saved += [visual_path] + ([thumb] if thumb else [])
                 _MOD_CACHE[visual_mod.name] = (visual_mod,)
                 print(f"[CreateH3RefMod] saved {_summarize(visual_mod)} -> {visual_path}")
             if include_audio:
                 audio_mod = rows[-1][0]
                 audio_path = audio_mod.save(audio_path_no_ext)
+                if saved is not None:
+                    saved.append(audio_path)
                 _MOD_CACHE[audio_mod.name] = (audio_mod,)
                 print(f"[CreateH3RefMod] saved {_summarize(audio_mod)} -> {audio_path}")
         if len(_MOD_CACHE) > _MOD_CACHE_MAX:
             _MOD_CACHE.pop(next(iter(_MOD_CACHE)))
+        if ON_FLOYO:  # never keep a team's RefMod in a shared worker's RAM
+            _MOD_CACHE.clear()
         _nodes_mod._MOD_LIST_CACHE_KEY = None  # refresh the loader dropdown
     else:
         if visual_mod is not None:
@@ -927,6 +958,18 @@ def _create_mod_from_folder(
             print(f"[CreateH3RefMod] {_summarize(rows[-1][0])} (not saved)")
     print(f"[CreateH3RefMod] complete: {len(rows)} reference(s), {total_tokens} tokens")
     return rows
+
+
+def _node_output(rows, saved: Optional[List[str]]) -> io.NodeOutput:
+    """Floyo uploads to My Files only the output files a node lists in its ui."""
+    if not saved:
+        return io.NodeOutput(rows)
+    out_dir = folder_paths.get_output_directory()
+    files = []
+    for path in saved:
+        subfolder, filename = os.path.split(os.path.relpath(path, out_dir))
+        files.append({"filename": filename, "subfolder": subfolder.replace(os.sep, "/"), "type": "output"})
+    return io.NodeOutput(rows, ui={"refmod_files": files})  # not 'images': no preview, as stock
 
 
 class H3RefModCreateFromFolder(io.ComfyNode):
@@ -1067,6 +1110,13 @@ class H3RefModCreateFromFolder(io.ComfyNode):
             is_output_node=True,
         )
 
+    if ON_FLOYO:
+        # A Floyo worker's output cache is shared by every team and run, and the same
+        # RefMod name is a different team's file there: never reuse a result.
+        @classmethod
+        def fingerprint_inputs(cls, **kwargs):
+            return float("nan")
+
     @classmethod
     def execute(cls, folder, use_folder_as_name, name, mode, concept_type, audio_concept_type, vae, audio_vae=None,
                 ref_resolution=1024, pool_h=16, pool_w=16, latent_frames=16,
@@ -1087,6 +1137,7 @@ class H3RefModCreateFromFolder(io.ComfyNode):
                 "(absolute path, or a name inside input/) — the node refuses to run "
                 "without one so it can't accidentally scan your whole input/ directory.")
         folder = _resolve_folder(folder)
+        saved = [] if ON_FLOYO else None
         mode = normalize_mode(mode)
         print(
             f"[H3RefModCreateFromFolder] start: folder='{raw_folder}' -> '{folder}', "
@@ -1116,10 +1167,10 @@ class H3RefModCreateFromFolder(io.ComfyNode):
                     audio_budget_policy, max_total_tokens,
                     _auto_folder_description(sub, concept_type), subfolder,
                     save, save_layout, budget_policy, merge, motion_only, extraction_preset,
-                    include_images=include_images,
+                    include_images=include_images, saved=saved,
                 )
                 mods.extend(created)
-            return io.NodeOutput(mods)
+            return _node_output(mods, saved)
 
         name = _folder_refmod_name(folder) if use_folder_as_name else _sanitize_name(name)
         rows = _create_mod_from_folder(
@@ -1129,9 +1180,9 @@ class H3RefModCreateFromFolder(io.ComfyNode):
             audio_max_seconds, audio_max_tokens,
             audio_budget_policy, max_total_tokens, description, subfolder,
             save, save_layout, budget_policy, merge, motion_only, extraction_preset,
-            include_images=include_images,
+            include_images=include_images, saved=saved,
         )
-        return io.NodeOutput(rows)
+        return _node_output(rows, saved)
 
 
 NODE_CLASS_MAPPINGS = {

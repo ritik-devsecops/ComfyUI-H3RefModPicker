@@ -208,6 +208,23 @@ const PRESET_CONFIG = {
     },
 };
 
+function onFloyo() {
+    try {
+        return typeof window.parent?.floyo?.uploadImage === "function";
+    } catch (e) {
+        return false;
+    }
+}
+
+/** The folder as Floyo downloads it for a run: My Files > inputs is ComfyUI's input/ there. */
+function floyoFolder(value) {
+    let path = String(value ?? "").trim().replace(/^"+|"+$/g, "").trim()
+        .replace(/\\/g, "/").replace(/\/+$/, "");
+    if (!path || path.startsWith("/") || /^[A-Za-z]:\//.test(path)) return path;  // the node says why
+    if (path.startsWith("input/#")) path = path.slice("input/".length);
+    return path.startsWith("#") || path.startsWith("(") ? path : `#inputs/${path.replace(/^\.\/+/, "")}`;
+}
+
 function findWidget(node, name) {
     return node.widgets?.find((widget) => widget?.name === name) || null;
 }
@@ -341,6 +358,14 @@ function enhanceCreateNode(node) {
     };
 
     addAspectRatioReminder(node);
+    // Floyo: only the queued prompt gets the downloadable form; the box keeps what the user typed.
+    const folderWidget = onFloyo() ? findWidget(node, "folder") : null;
+    if (folderWidget) {
+        const serializeValue = folderWidget.serializeValue;
+        folderWidget.serializeValue = async function (...args) {
+            return floyoFolder(serializeValue ? await serializeValue.apply(this, args) : this.value);
+        };
+    }
     moveWidgetAfter(node, "extraction_preset", "name");
     moveWidgetAfter(node, "advanced", "extraction_preset");
     moveWidgetAfter(node, "budget_policy", "max_total_tokens");

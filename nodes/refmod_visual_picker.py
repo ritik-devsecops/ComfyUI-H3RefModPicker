@@ -13,7 +13,7 @@ from ..py.refmod_browser import (
     safe_file_path,
 )
 from ..py.refmod_core import H3RefMod, load_refmods_from_file
-from ..py.refmod_common import _prompt_hint
+from ..py.refmod_common import ON_FLOYO, _prompt_hint, require_downloaded
 from .refmod_loader import _MAX_WEIGHT, _append_weighted_mod, _weight_display
 
 _VISUAL_MOD_CACHE: Dict[str, Tuple[H3RefMod, ...]] = {}
@@ -24,13 +24,17 @@ def _load_mods_from_path(mod_path: str) -> List[H3RefMod]:
     path = safe_file_path(mod_path)
     if not path.lower().endswith(".safetensors"):
         raise ValueError("Selected file is not a RefMod safetensors file.")
-    if path in _VISUAL_MOD_CACHE:
+    if not ON_FLOYO and path in _VISUAL_MOD_CACHE:
         return list(_VISUAL_MOD_CACHE[path])
+    require_downloaded(path[:-len(".safetensors")])
     mods = list(load_refmods_from_file(path[:-len(".safetensors")], device="cpu"))
     if not any(mod.kind == "audio" for mod in mods):
         paired_audio = paired_mod_path(path[:-len(".safetensors")], "audio")
         if paired_audio is not None:
+            require_downloaded(paired_audio[:-len(".safetensors")])
             mods.extend(load_refmods_from_file(paired_audio[:-len(".safetensors")], device="cpu"))
+    if ON_FLOYO:  # the same path is a different team's file on a shared worker: never cache it
+        return mods
     _VISUAL_MOD_CACHE[path] = tuple(mods)
     if len(_VISUAL_MOD_CACHE) > _VISUAL_MOD_CACHE_MAX:
         _VISUAL_MOD_CACHE.pop(next(iter(_VISUAL_MOD_CACHE)))
@@ -96,6 +100,13 @@ class H3RefModVisualPicker:
     def VALIDATE_INPUTS(cls, **kwargs):
         return True
 
+    if ON_FLOYO:
+        # A Floyo worker's output cache is shared by every team and run, and the same
+        # RefMod name is a different team's file there: never reuse a result.
+        @classmethod
+        def IS_CHANGED(cls, **kwargs):
+            return float("nan")
+
     def pick(self, mod_path: str, video_weight: float = 1.0, audio_weight: float = 1.0,
              mods=None, strength=None, audio_strength=None):
         rows: List[Tuple[H3RefMod, float]] = []
@@ -133,6 +144,8 @@ NODE_DISPLAY_NAME_MAPPINGS = {"H3RefModVisualPicker": "Visual H3 RefMod Picker"}
 
 @server.PromptServer.instance.routes.get("/h3refmods/refmod-browser/root")
 async def refmod_browser_root(request):
+    if ON_FLOYO:  # the editor has no team context on Floyo; the picker lists My Files instead
+        return server.web.json_response({"ok": False, "error": "not available on Floyo"}, status=404)
     try:
         return server.web.json_response({"ok": True, "root": browser_root()})
     except Exception as exc:
@@ -141,6 +154,8 @@ async def refmod_browser_root(request):
 
 @server.PromptServer.instance.routes.get("/h3refmods/refmod-browser/list")
 async def refmod_browser_list(request):
+    if ON_FLOYO:  # the editor has no team context on Floyo; the picker lists My Files instead
+        return server.web.json_response({"ok": False, "error": "not available on Floyo"}, status=404)
     try:
         data = list_browser_dir(request.query.get("path", "").strip())
         return server.web.json_response({"ok": True, **data})
@@ -152,6 +167,8 @@ async def refmod_browser_list(request):
 
 @server.PromptServer.instance.routes.get("/h3refmods/refmod-browser/file")
 async def refmod_browser_file(request):
+    if ON_FLOYO:  # the editor has no team context on Floyo; the picker lists My Files instead
+        return server.web.json_response({"ok": False, "error": "not available on Floyo"}, status=404)
     try:
         path = safe_file_path(request.query.get("path", "").strip())
         if os.path.splitext(path)[1].lower() not in PREVIEW_EXTS:

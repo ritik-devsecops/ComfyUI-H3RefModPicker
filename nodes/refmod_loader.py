@@ -17,8 +17,10 @@ from ..py.refmod_common import (
 
 
 from ..py.refmod_common import (
+    ON_FLOYO,
     refmods_dir,
     refmods_dirs,
+    require_downloaded,
 )
 
 _MOD_CACHE: Dict[str, Tuple[H3RefMod, ...]] = {}
@@ -32,10 +34,12 @@ _MAX_WEIGHT = 10.0
 
 # Mod storage lives in ComfyUI's models/ tree (created on first run) and is
 # registered as a first-class folder type so it shows up next to loras/unet.
-try:
-    folder_paths.add_model_folder_path("refmods", refmods_dir())
-except Exception:
-    pass
+# Not on Floyo, where the folder is the team's output/refmods.
+if not ON_FLOYO:
+    try:
+        folder_paths.add_model_folder_path("refmods", refmods_dir())
+    except Exception:
+        pass
 
 # ═══════════════════════════════════════════════════════════════════════════
 # Mods folder helpers
@@ -88,9 +92,10 @@ def _refresh_mod_lookup() -> Dict[str, str]:
     names_by_rel: Dict[str, List[Tuple[int, str]]] = {}
     for index, mods_dir in enumerate(mods_dirs):
         for rel_stem, abs_stem in _iter_mod_paths(mods_dir):
-            meta = read_refmod_meta(abs_stem)
-            if meta is None or meta.get("kind") not in ("image", "video", "audio", "bundle"):
-                continue
+            if not ON_FLOYO:  # Floyo's editor holds 0-byte stand-ins of the team's files: list by name
+                meta = read_refmod_meta(abs_stem)
+                if meta is None or meta.get("kind") not in ("image", "video", "audio", "bundle"):
+                    continue
             names_by_rel.setdefault(rel_stem, []).append((index, abs_stem))
 
     labels = _root_display_labels(mods_dirs)
@@ -143,10 +148,13 @@ def _find_mod_path(name: str) -> str:
 
 
 def _load_mods(name: str) -> List[H3RefMod]:
-    if name in _MOD_CACHE:
+    if not ON_FLOYO and name in _MOD_CACHE:
         return list(_MOD_CACHE[name])
     path = _find_mod_path(name)
+    require_downloaded(path)
     mods = tuple(load_refmods_from_file(path, device="cpu"))
+    if ON_FLOYO:  # one name is a different team's file on a shared worker: never cache it
+        return list(mods)
     _MOD_CACHE[name] = mods
     if len(_MOD_CACHE) > _MOD_CACHE_MAX:
         _MOD_CACHE.pop(next(iter(_MOD_CACHE)))
@@ -237,6 +245,13 @@ class H3RefModLoader:
             return f"RefMod '{mod}' not found in any configured refmods folder. Run Create H3 RefMod first."
         return True
 
+    if ON_FLOYO:
+        # A Floyo worker's output cache is shared by every team and run, and the same
+        # RefMod name is a different team's file there: never reuse a result.
+        @classmethod
+        def IS_CHANGED(cls, **kwargs):
+            return float("nan")
+
     def load(self, mod, weight=1.0, video_weight=1.0, audio_weight=1.0, mods=None, strength=None, audio_strength=None):
         rows = list(mods) if mods is not None else []
         if strength is not None:
@@ -273,6 +288,8 @@ NODE_DISPLAY_NAME_MAPPINGS = {
 
 @server.PromptServer.instance.routes.get("/h3refmods/refmod-loader/capabilities")
 async def refmod_loader_capabilities(request):
+    if ON_FLOYO:  # the editor has no RefMod bytes and no team context on Floyo
+        return server.web.json_response({"ok": False, "error": "not available on Floyo"}, status=404)
     try:
         name = str(request.query.get("mod", "") or "").strip()
         if not name:

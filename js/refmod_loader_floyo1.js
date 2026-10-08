@@ -1,6 +1,16 @@
 import { app } from "../../scripts/app.js";
 import { api } from "../../scripts/api.js";
 
+const FLOYO_INPUT_FILES = "__FLOYO_INPUT_FILES__";
+
+function onFloyo() {
+    try {
+        return typeof window.parent?.floyo?.uploadImage === "function";
+    } catch (e) {
+        return false;
+    }
+}
+
 function findWidget(node, name) {
     return node.widgets?.find((widget) => widget?.name === name) || null;
 }
@@ -57,7 +67,7 @@ function applyModalityVisibility(node, caps) {
 async function refreshLoaderVisibility(node) {
     const modWidget = findWidget(node, "mod");
     const mod = String(modWidget?.value || "").trim();
-    if (!mod) {
+    if (!mod || onFloyo()) {  // Floyo's editor has no RefMod bytes: both weights, as on any lookup error
         applyModalityVisibility(node, { has_visual: true, has_audio: true });
         return;
     }
@@ -106,6 +116,22 @@ app.registerExtension({
                 void refreshLoaderVisibility(this);
                 return configureResult;
             };
+
+            // Floyo downloads a run's files from paths in the prompt, and 'mod' is a bare
+            // name: list its file here. Sent with the prompt only (ComfyUI drops an input
+            // the node doesn't declare), never saved, and last so saved positions hold.
+            if (onFloyo() && modWidget) {
+                const files = node.addWidget("text", "input_files", "", () => {});
+                files.hidden = true;
+                files.type = "hidden";
+                files.computeSize = () => [0, -4];
+                files.serialize = false;
+                files.options = { ...(files.options || {}), hidden: true };
+                files.serializeValue = () => {
+                    const mod = String(modWidget.value || "").trim();
+                    return mod ? `${FLOYO_INPUT_FILES}\n(as-input)#outputs/refmods/${mod}.safetensors` : "";
+                };
+            }
 
             void refreshLoaderVisibility(node);
             return result;

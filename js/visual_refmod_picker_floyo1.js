@@ -168,6 +168,11 @@ function resolvePathFromRoot(path, root) {
 
 function buildPreviewUrl(path) {
     if (!path) return PLACEHOLDER_IMAGE_PATH;
+    if (onFloyo()) {  // My Files > outputs > refmods, served like any output image
+        const rel = relativePathFromRoot(path, FLOYO_ROOT);
+        return api.apiURL(`/view?filename=${encodeURIComponent(basenameForDisplay(rel))}` +
+            `&subfolder=${encodeURIComponent(["refmods", dirnameForPath(rel)].filter(Boolean).join("/"))}&type=output`);
+    }
     return api.apiURL(`/h3refmods/refmod-browser/file?path=${encodeURIComponent(path)}`);
 }
 
@@ -203,7 +208,142 @@ function pathsEqual(a, b) {
     return normalizePathKey(a) === normalizePathKey(b);
 }
 
+/* ---------------------------------------------------------------- floyo
+ * On Floyo the editor and the machine that runs a graph are different
+ * computers, and RefMods live in the team's My Files > outputs > refmods.
+ * The picker lists them from there and the run downloads the chosen file. */
+const FLOYO_ROOT = "/output/refmods";
+const FLOYO_INPUT_FILES = "__FLOYO_INPUT_FILES__";
+
+function onFloyo() {
+    try {
+        return typeof window.parent?.floyo?.uploadImage === "function";
+    } catch (e) {
+        return false;
+    }
+}
+
+/** Team id at the end of Floyo's proxy URL (".../~/<team>"). */
+function floyoTeam() {
+    try {
+        return String(window.parent.floyo.NEXT_PUBLIC_COMFY_API_PROXY_URL || "").split("/~/").pop() || "team";
+    } catch (e) {
+        return "team";
+    }
+}
+
+async function teamFiles(path) {
+    const resp = await fetch(path, { headers: { "x-team-id": floyoTeam() } });
+    const data = await resp.json().catch(() => ({}));
+    if (!resp.ok) throw Object.assign(new Error(data.error || `Request failed (${resp.status})`), { status: resp.status });
+    return data;
+}
+
+// refmod_browser.py's pairing and preview rules, over the My Files listing
+const FLOYO_SUFFIXES = [["visual", ["_visual", "_video"]], ["audio", ["_audio"]]];
+const FLOYO_FILE_SUFFIXES = { visual: ["_visual", "_Visual", "_video", "_Video"], audio: ["_audio", "_Audio"] };
+const FLOYO_PREVIEW_EXTS = [".png", ".jpg", ".jpeg", ".webp"];
+const floyoPairedAudio = new Map();  // RefMod path -> its *_Audio file, from the last listing
+
+function floyoStripSuffix(stem) {
+    const lower = basenameForDisplay(stem).toLowerCase();
+    for (const [kind, suffixes] of FLOYO_SUFFIXES) {
+        for (const suffix of suffixes) {
+            if (lower.endsWith(suffix)) return [stem.slice(0, -suffix.length), kind];
+        }
+    }
+    return [stem, null];
+}
+
+async function floyoListFolder(path) {
+    const current = (resolvePathFromRoot(path || FLOYO_ROOT, FLOYO_ROOT) || FLOYO_ROOT).replace(/\/+$/, "");
+    const atRoot = pathsEqual(current, FLOYO_ROOT);
+    if (!atRoot && !normalizePathKey(current).startsWith(`${normalizePathKey(FLOYO_ROOT)}/`)) {
+        throw new Error("Path is outside the RefMods folder");
+    }
+    const folderPath = current.slice(1);  // "output/refmods[/sub]"
+    let items;
+    try {
+        items = (await teamFiles(`/api/storage/list-files/user?folderPath=${encodeURIComponent(folderPath)}`)).files || [];
+    } catch (err) {
+        if (err.status !== 404 || !atRoot) throw err;
+        items = [];  // nothing created yet
+    }
+    if (!items.length && !atRoot) {  // a missing folder: 404 here, so the caller falls back to the root
+        await teamFiles(`/api/storage/folder-info?folderPath=${encodeURIComponent(folderPath)}`);
+    }
+    const visible = items.filter((item) => !item.name.startsWith("."));
+    const files = new Set(visible.filter((item) => !item.isFolder).map((item) => `${current}/${item.name}`));
+    const dirs = visible.filter((item) => item.isFolder && item.name !== "graph_presets")
+        .map((item) => ({ name: item.name, path: `${current}/${item.name}` }));
+    const mods = [];
+    for (const file of files) {
+        if (!file.toLowerCase().endsWith(".safetensors")) continue;
+        const stem = file.slice(0, -".safetensors".length);
+        const [base, kind] = floyoStripSuffix(stem);
+        const paired = (target) => kind
+            ? FLOYO_FILE_SUFFIXES[target].map((suffix) => `${base}${suffix}.safetensors`).find((c) => c !== file && files.has(c)) || null
+            : null;
+        const pairedVisual = paired("visual");
+        const pairedAudio = paired("audio");
+        if (kind === "audio" && pairedVisual) continue;
+        const pairedSplit = Boolean(pairedVisual || pairedAudio);
+        // the editor cannot read a RefMod's header here, so the suffix tells the modality
+        const hasVisual = pairedSplit || kind !== "audio";
+        const preview = hasVisual
+            ? (kind ? [base, stem] : [stem]).flatMap((s) => FLOYO_PREVIEW_EXTS.map((ext) => s + ext)).find((c) => files.has(c)) || null
+            : null;
+        floyoPairedAudio.set(normalizePathKey(file), pairedAudio);
+        mods.push({
+            name: `${basenameForDisplay(kind ? base : stem) || basenameForDisplay(stem)}.safetensors`,
+            path: file,
+            preview_path: preview,
+            kind: "unknown",
+            has_visual: hasVisual,
+            has_audio: pairedSplit || kind !== "visual",
+            paired_split: pairedSplit,
+            paired_audio_path: pairedAudio,
+        });
+    }
+    if (atRoot) {  // as _annotate_merged_duplicates
+        for (const list of [dirs, mods]) {
+            const counts = {};
+            for (const item of list) counts[item.name.toLowerCase()] = (counts[item.name.toLowerCase()] || 0) + 1;
+            for (const item of list) if (counts[item.name.toLowerCase()] > 1) item.name = `${item.name} [refmods]`;
+        }
+    }
+    const byName = (a, b) => {  // Python's sort(key=str.lower)
+        const x = a.name.toLowerCase(), y = b.name.toLowerCase();
+        return x < y ? -1 : x > y ? 1 : 0;
+    };
+    return {
+        ok: true,
+        root: FLOYO_ROOT,
+        current_path: current,
+        parent_path: atRoot ? null : dirnameForPath(current),
+        dirs: dirs.sort(byName),
+        mods: mods.sort(byName),
+    };
+}
+
+/** input_files for the run: the chosen RefMod and the *_Audio file loaded beside it. */
+async function floyoPickerFiles(modPath) {
+    const rel = relativePathFromRoot(normalizeSelectedModPath(modPath), FLOYO_ROOT);
+    if (!rel) return "";
+    const path = `${FLOYO_ROOT}/${rel}`;
+    if (!floyoPairedAudio.has(normalizePathKey(path))) {  // the picker lists the folder on load
+        try {
+            await floyoListFolder(dirnameForPath(path));
+        } catch (err) {
+            console.warn("[VisualRefModPicker] Could not look up the paired audio RefMod:", err);
+        }
+    }
+    const files = [path, floyoPairedAudio.get(normalizePathKey(path))].filter(Boolean);
+    return [FLOYO_INPUT_FILES, ...files.map((file) => `(as-input)#outputs/${file.slice("/output/".length)}`)].join("\n");
+}
+
 async function getRefModsRoot() {
+    if (onFloyo()) return FLOYO_ROOT;
     try {
         const resp = await api.fetchApi("/h3refmods/refmod-browser/root");
         if (!resp.ok) return "";
@@ -216,6 +356,7 @@ async function getRefModsRoot() {
 }
 
 async function listBrowserFolder(path) {
+    if (onFloyo()) return await floyoListFolder(path);
     const query = path ? `?path=${encodeURIComponent(path)}` : "";
     const resp = await api.fetchApi(`/h3refmods/refmod-browser/list${query}`);
     if (!resp.ok) {
@@ -502,7 +643,9 @@ function createRefModBrowserModal(initialPath, onSelect) {
         `;
         const img = document.createElement("img");
         installPreviewFallback(img);
-        img.src = entry.preview_path ? `${buildPreviewUrl(entry.preview_path)}&${Date.now()}` : PLACEHOLDER_IMAGE_PATH;
+        img.src = entry.preview_path
+            ? (onFloyo() ? buildPreviewUrl(entry.preview_path) : `${buildPreviewUrl(entry.preview_path)}&${Date.now()}`)
+            : PLACEHOLDER_IMAGE_PATH;
         img.style.cssText = `
             width: 100%;
             height: 100%;
@@ -1052,6 +1195,19 @@ app.registerExtension({
                     node.widgets.splice(buttonIndex, 1);
                     node.widgets.splice(pickerIndex + 1, 0, browseButton);
                 }
+            }
+
+            // Floyo downloads a run's files from paths in the prompt: list the chosen
+            // RefMod here. Sent with the prompt only (ComfyUI drops an input the node
+            // doesn't declare), never saved, and last so saved positions hold.
+            if (onFloyo() && modPathWidget) {
+                const files = node.addWidget("text", "input_files", "", () => {});
+                files.hidden = true;
+                files.type = "hidden";
+                files.computeSize = () => [0, -4];
+                files.serialize = false;
+                files.options = { ...(files.options || {}), hidden: true };
+                files.serializeValue = () => floyoPickerFiles(modPathWidget.value);
             }
 
             clickCatcher.addEventListener("click", async (event) => {

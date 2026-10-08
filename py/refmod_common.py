@@ -9,15 +9,27 @@ import torch
 
 IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif"}
 
+# Floyo runs the editor and each graph on different machines, and a run reaches
+# the team's files (My Files) only through output/. Only Floyo's ComfyUI ships a
+# top-level 'floyo' package.
+try:
+    from floyo import floyo as _floyo  # noqa: F401
+    ON_FLOYO = True
+except Exception:
+    ON_FLOYO = False
+
 
 def refmods_dir() -> str:
     """ComfyUI models/refmods — the mod storage folder, created on first use.
 
     Sits next to loras/, unet/ etc. instead of inside the pack folder, so mods
-    live in the standard model tree.
+    live in the standard model tree. On Floyo it is output/refmods (My Files >
+    outputs > refmods): models/ there is never saved and on GPU machines is a
+    model store every team shares.
     """
     import folder_paths
-    d = os.path.join(folder_paths.models_dir, "refmods")
+    base = folder_paths.get_output_directory() if ON_FLOYO else folder_paths.models_dir
+    d = os.path.join(base, "refmods")
     os.makedirs(d, exist_ok=True)
     return d
 
@@ -31,6 +43,8 @@ def refmods_dirs() -> List[str]:
     """
     import folder_paths
 
+    if ON_FLOYO:  # the team's own RefMods only, never another pack's shared folder
+        return [os.path.abspath(refmods_dir())]
     candidates = [refmods_dir()]
     try:
         candidates += list(folder_paths.get_folder_paths("refmods"))
@@ -48,6 +62,15 @@ def refmods_dirs() -> List[str]:
         seen.add(real)
         roots.append(os.path.abspath(directory))
     return roots
+
+
+def require_downloaded(path_no_ext: str) -> None:
+    """On Floyo a RefMod the run did not download is a 0-byte stand-in: say so plainly."""
+    path = path_no_ext + ".safetensors"
+    if ON_FLOYO and os.path.isfile(path) and os.path.getsize(path) == 0:
+        raise FileNotFoundError(
+            f"RefMod '{os.path.basename(path_no_ext)}' was not downloaded for this run. "
+            "Queue the workflow again from the editor.")
 
 
 def list_image_files(folder: str) -> List[str]:
