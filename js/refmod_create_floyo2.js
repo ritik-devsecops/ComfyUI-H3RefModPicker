@@ -222,7 +222,10 @@ function floyoFolder(value) {
         .replace(/\\/g, "/").replace(/\/+$/, "");
     if (!path || path.startsWith("/") || /^[A-Za-z]:\//.test(path)) return path;  // the node says why
     if (path.startsWith("input/#")) path = path.slice("input/".length);
-    return path.startsWith("#") || path.startsWith("(") ? path : `#inputs/${path.replace(/^\.\/+/, "")}`;
+    path = path.startsWith("#") || path.startsWith("(") ? path : `#inputs/${path.replace(/^\.\/+/, "")}`;
+    // only a folder inside My Files > inputs: Floyo downloads every file under the path for the run
+    const inside = /^#(community_)?inputs\/./.test(path) && !path.split("/").some((part) => part === "." || part === "..");
+    return inside ? path : "";
 }
 
 function findWidget(node, name) {

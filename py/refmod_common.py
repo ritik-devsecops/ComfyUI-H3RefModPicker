@@ -16,7 +16,9 @@ try:
     from floyo import floyo as _floyo  # noqa: F401
     ON_FLOYO = True
 except Exception:
-    ON_FLOYO = False
+    _floyo = None
+    # fail closed: every Floyo ComfyUI sets COMFYUI_TYPE
+    ON_FLOYO = "COMFYUI_TYPE" in os.environ
 
 
 def refmods_dir() -> str:
@@ -71,6 +73,33 @@ def require_downloaded(path_no_ext: str) -> None:
         raise FileNotFoundError(
             f"RefMod '{os.path.basename(path_no_ext)}' was not downloaded for this run. "
             "Queue the workflow again from the editor.")
+
+
+def floyo_team_id() -> Optional[str]:
+    """The team the current Floyo run belongs to (set by Floyo for every run)."""
+    team = getattr(_floyo, "team_id", None) if _floyo is not None else None
+    return str(team) if team else None
+
+
+def files_digest(paths: List[str], root: Optional[str] = None) -> Optional[str]:
+    """sha256 over the files' names, sizes and bytes, or None when one is missing or a 0-byte stand-in.
+
+    Names are relative to ``root`` when given, so a renamed or reorganised folder changes it.
+
+    Same bytes give the same RefMod, so a cache keyed on this never serves one
+    team's file to another (the way Floyo's LoadImage keys on file contents).
+    """
+    import hashlib
+    digest = hashlib.sha256()
+    for path in paths:
+        if not os.path.isfile(path) or os.path.getsize(path) == 0:
+            return None
+        name = os.path.relpath(path, root) if root else os.path.basename(path)
+        digest.update(f"{name}\0{os.path.getsize(path)}\0".encode("utf-8", "replace"))
+        with open(path, "rb") as handle:
+            for chunk in iter(lambda: handle.read(1 << 20), b""):
+                digest.update(chunk)
+    return digest.hexdigest()
 
 
 def list_image_files(folder: str) -> List[str]:

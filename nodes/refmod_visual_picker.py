@@ -13,7 +13,7 @@ from ..py.refmod_browser import (
     safe_file_path,
 )
 from ..py.refmod_core import H3RefMod, load_refmods_from_file
-from ..py.refmod_common import ON_FLOYO, _prompt_hint, require_downloaded
+from ..py.refmod_common import ON_FLOYO, _prompt_hint, files_digest, require_downloaded
 from .refmod_loader import _MAX_WEIGHT, _append_weighted_mod, _weight_display
 
 _VISUAL_MOD_CACHE: Dict[str, Tuple[H3RefMod, ...]] = {}
@@ -101,11 +101,22 @@ class H3RefModVisualPicker:
         return True
 
     if ON_FLOYO:
-        # A Floyo worker's output cache is shared by every team and run, and the same
-        # RefMod name is a different team's file there: never reuse a result.
+        # A Floyo worker's output cache is shared by every team and run, and the same RefMod
+        # path is a different team's file there: key the result on the files' bytes, never the path.
         @classmethod
-        def IS_CHANGED(cls, **kwargs):
-            return float("nan")
+        def IS_CHANGED(cls, mod_path="", **kwargs):
+            try:
+                path = safe_file_path(mod_path)
+                stem = path[:-len(".safetensors")]
+                paths = [path]
+                paired_audio = paired_mod_path(stem, "audio")
+                if paired_audio is not None:
+                    paths.append(paired_audio)
+                paths += [p[:-len(".safetensors")] + ".json" for p in list(paths)
+                          if os.path.isfile(p[:-len(".safetensors")] + ".json")]
+                return files_digest(paths) or float("nan")
+            except Exception:
+                return float("nan")
 
     def pick(self, mod_path: str, video_weight: float = 1.0, audio_weight: float = 1.0,
              mods=None, strength=None, audio_strength=None):

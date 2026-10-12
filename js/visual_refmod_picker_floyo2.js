@@ -233,7 +233,8 @@ function floyoTeam() {
 }
 
 async function teamFiles(path) {
-    const resp = await fetch(path, { headers: { "x-team-id": floyoTeam() } });
+    // a hung listing must not hold up queueing the workflow
+    const resp = await fetch(path, { headers: { "x-team-id": floyoTeam() }, signal: AbortSignal.timeout(8000) });
     const data = await resp.json().catch(() => ({}));
     if (!resp.ok) throw Object.assign(new Error(data.error || `Request failed (${resp.status})`), { status: resp.status });
     return data;
@@ -244,6 +245,7 @@ const FLOYO_SUFFIXES = [["visual", ["_visual", "_video"]], ["audio", ["_audio"]]
 const FLOYO_FILE_SUFFIXES = { visual: ["_visual", "_Visual", "_video", "_Video"], audio: ["_audio", "_Audio"] };
 const FLOYO_PREVIEW_EXTS = [".png", ".jpg", ".jpeg", ".webp"];
 const floyoPairedAudio = new Map();  // RefMod path -> its *_Audio file, from the last listing
+const floyoFolderFiles = new Map();  // folder path -> every file in it, from the last listing
 
 function floyoStripSuffix(stem) {
     const lower = basenameForDisplay(stem).toLowerCase();
@@ -274,6 +276,7 @@ async function floyoListFolder(path) {
     }
     const visible = items.filter((item) => !item.name.startsWith("."));
     const files = new Set(visible.filter((item) => !item.isFolder).map((item) => `${current}/${item.name}`));
+    floyoFolderFiles.set(normalizePathKey(current), files);
     const dirs = visible.filter((item) => item.isFolder && item.name !== "graph_presets")
         .map((item) => ({ name: item.name, path: `${current}/${item.name}` }));
     const mods = [];
@@ -300,7 +303,8 @@ async function floyoListFolder(path) {
             preview_path: preview,
             kind: "unknown",
             has_visual: hasVisual,
-            has_audio: pairedSplit || kind !== "visual",
+            // a legacy combined *_Video file may carry audio too, as refmod_browser.py reads from its header
+            has_audio: pairedSplit || kind !== "visual" || stem.toLowerCase().endsWith("_video"),
             paired_split: pairedSplit,
             paired_audio_path: pairedAudio,
         });
@@ -329,16 +333,26 @@ async function floyoListFolder(path) {
 /** input_files for the run: the chosen RefMod and the *_Audio file loaded beside it. */
 async function floyoPickerFiles(modPath) {
     const rel = relativePathFromRoot(normalizeSelectedModPath(modPath), FLOYO_ROOT);
-    if (!rel) return "";
+    // only a path inside My Files > outputs > refmods can be staged; the node reports anything else
+    if (!rel || isAbsoluteFsPath(rel) || rel.split("/").includes("..")) return "";
     const path = `${FLOYO_ROOT}/${rel}`;
-    if (!floyoPairedAudio.has(normalizePathKey(path))) {  // the picker lists the folder on load
-        try {
-            await floyoListFolder(dirnameForPath(path));
-        } catch (err) {
-            console.warn("[VisualRefModPicker] Could not look up the paired audio RefMod:", err);
-        }
+    try {  // list the folder fresh on every queue, so a pair added or removed since is right
+        await floyoListFolder(dirnameForPath(path));
+    } catch (err) {
+        console.warn("[VisualRefModPicker] Could not look up the paired audio RefMod:", err);
+        // stage only the chosen file rather than a pair or sidecar that may be gone since
+        floyoPairedAudio.delete(normalizePathKey(path));
+        floyoFolderFiles.delete(normalizePathKey(dirnameForPath(path)));
     }
-    const files = [path, floyoPairedAudio.get(normalizePathKey(path))].filter(Boolean);
+    // legacy RefMods keep their metadata in a <name>.json beside the file
+    const inFolder = floyoFolderFiles.get(normalizePathKey(dirnameForPath(path))) || new Set();
+    // a pair from an older listing is not staged once the chosen file itself is gone
+    const listed = [...inFolder].some((file) => normalizePathKey(file) === normalizePathKey(path));
+    const files = [path, listed ? floyoPairedAudio.get(normalizePathKey(path)) : null].filter(Boolean);
+    for (const file of listed ? [...files] : []) {
+        const sidecar = `${file.slice(0, -".safetensors".length)}.json`;
+        if (inFolder.has(sidecar)) files.push(sidecar);
+    }
     return [FLOYO_INPUT_FILES, ...files.map((file) => `(as-input)#outputs/${file.slice("/output/".length)}`)].join("\n");
 }
 

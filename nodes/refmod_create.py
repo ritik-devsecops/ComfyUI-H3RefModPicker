@@ -17,8 +17,11 @@ import comfy.utils
 import folder_paths
 from comfy_api.latest import io
 
+from ..py.refmod_browser import AUDIO_FILE_SUFFIXES, VISUAL_FILE_SUFFIXES
 from ..py.refmod_common import (
     ON_FLOYO,
+    files_digest,
+    floyo_team_id,
     list_image_files,
     refmods_dir,
 )
@@ -179,7 +182,7 @@ def _inside_floyo_inputs(path: str) -> bool:
     real = os.path.realpath(path)
     for name in ("#inputs", "#community_inputs"):
         root = os.path.realpath(os.path.join(folder_paths.get_input_directory(), name))
-        if real == root or real.startswith(root + os.sep):
+        if real.startswith(root + os.sep):  # a folder inside it, never the whole root
             return True
     return False
 
@@ -364,6 +367,18 @@ def _paired_refmod_names(base_name: str) -> Tuple[str, str]:
     return f"{base}{VISUAL_SUFFIX}", f"{base}{AUDIO_SUFFIX}"
 
 
+def _floyo_name_taken(out_dir: str, candidate: str) -> bool:
+    """On Floyo every file under a name is uploaded to My Files, so a bundle X, a split X_visual
+    and their shared X.<ext> thumbnail must not reuse another RefMod's name."""
+    if not ON_FLOYO:
+        return False
+    stem = os.path.join(out_dir, candidate)
+    names = [stem + ".safetensors"]
+    names += [stem + suffix + ".safetensors" for suffix in VISUAL_FILE_SUFFIXES + AUDIO_FILE_SUFFIXES]
+    names += [stem + ext for ext in (".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif")]
+    return any(os.path.isfile(path) for path in names)
+
+
 def _unique_split_mod_paths(out_dir: str, base_name: str, include_audio: bool) -> Tuple[str, str, str, str, str]:
     root = _base_refmod_name(base_name)
     candidate = root
@@ -374,7 +389,7 @@ def _unique_split_mod_paths(out_dir: str, base_name: str, include_audio: bool) -
         audio_path = os.path.join(out_dir, audio_name)
         visual_exists = os.path.isfile(visual_path + ".safetensors")
         audio_exists = os.path.isfile(audio_path + ".safetensors")
-        if not visual_exists and not audio_exists:
+        if not visual_exists and not audio_exists and not _floyo_name_taken(out_dir, candidate):
             return candidate, visual_name, visual_path, audio_name, audio_path
         attempt += 1
         candidate = f"{root}_{attempt}"
@@ -386,7 +401,7 @@ def _unique_bundle_mod_path(out_dir: str, base_name: str) -> Tuple[str, str]:
     attempt = 1
     while True:
         bundle_path = os.path.join(out_dir, candidate)
-        if not os.path.isfile(bundle_path + ".safetensors"):
+        if not os.path.isfile(bundle_path + ".safetensors") and not _floyo_name_taken(out_dir, candidate):
             return candidate, bundle_path
         attempt += 1
         candidate = f"{root}_{attempt}"
@@ -929,7 +944,8 @@ def _create_mod_from_folder(
             thumb = _copy_refmod_thumbnail(images, bundle_path_no_ext)
             if saved is not None:
                 saved += [destination] + ([thumb] if thumb else [])
-            _MOD_CACHE[bundle_name] = tuple(mod for mod, _ in rows)
+            if not ON_FLOYO:
+                _MOD_CACHE[bundle_name] = tuple(mod for mod, _ in rows)
             print(f"[CreateH3RefMod] saved bundle '{bundle_name}' with {len(rows)} member(s) -> {destination}")
         else:
             if visual_mod is not None:
@@ -937,14 +953,16 @@ def _create_mod_from_folder(
                 thumb = _copy_refmod_thumbnail(images, visual_path_no_ext)
                 if saved is not None:
                     saved += [visual_path] + ([thumb] if thumb else [])
-                _MOD_CACHE[visual_mod.name] = (visual_mod,)
+                if not ON_FLOYO:
+                    _MOD_CACHE[visual_mod.name] = (visual_mod,)
                 print(f"[CreateH3RefMod] saved {_summarize(visual_mod)} -> {visual_path}")
             if include_audio:
                 audio_mod = rows[-1][0]
                 audio_path = audio_mod.save(audio_path_no_ext)
                 if saved is not None:
                     saved.append(audio_path)
-                _MOD_CACHE[audio_mod.name] = (audio_mod,)
+                if not ON_FLOYO:
+                    _MOD_CACHE[audio_mod.name] = (audio_mod,)
                 print(f"[CreateH3RefMod] saved {_summarize(audio_mod)} -> {audio_path}")
         if len(_MOD_CACHE) > _MOD_CACHE_MAX:
             _MOD_CACHE.pop(next(iter(_MOD_CACHE)))
@@ -1111,11 +1129,22 @@ class H3RefModCreateFromFolder(io.ComfyNode):
         )
 
     if ON_FLOYO:
-        # A Floyo worker's output cache is shared by every team and run, and the same
-        # RefMod name is a different team's file there: never reuse a result.
+        # A Floyo worker's output cache is shared by every team and run: reuse a result only
+        # for the same team and the same folder contents, like stock ComfyUI does for one user.
         @classmethod
-        def fingerprint_inputs(cls, **kwargs):
-            return float("nan")
+        def fingerprint_inputs(cls, folder="", **kwargs):
+            team = floyo_team_id()
+            if not team or not str(folder or "").strip().strip('"'):  # execute() refuses it too
+                return float("nan")
+            try:
+                root = _resolve_folder(folder)
+                paths = sorted(os.path.join(d, f) for d, _, names in os.walk(root) for f in names)
+            except Exception:
+                return float("nan")
+            digest = files_digest(paths, root)
+            if digest is None:
+                return float("nan")
+            return f"{team}|{len(paths)}|{digest}"
 
     @classmethod
     def execute(cls, folder, use_folder_as_name, name, mode, concept_type, audio_concept_type, vae, audio_vae=None,

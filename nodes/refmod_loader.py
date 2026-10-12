@@ -18,6 +18,7 @@ from ..py.refmod_common import (
 
 from ..py.refmod_common import (
     ON_FLOYO,
+    files_digest,
     refmods_dir,
     refmods_dirs,
     require_downloaded,
@@ -246,11 +247,16 @@ class H3RefModLoader:
         return True
 
     if ON_FLOYO:
-        # A Floyo worker's output cache is shared by every team and run, and the same
-        # RefMod name is a different team's file there: never reuse a result.
+        # A Floyo worker's output cache is shared by every team and run, and the same RefMod
+        # name is a different team's file there: key the result on the file's bytes, never its name.
         @classmethod
-        def IS_CHANGED(cls, **kwargs):
-            return float("nan")
+        def IS_CHANGED(cls, mod="", **kwargs):
+            try:
+                stem = _find_mod_path(mod)
+                paths = [stem + ".safetensors"] + [p for p in (stem + ".json",) if os.path.isfile(p)]
+                return files_digest(paths) or float("nan")
+            except Exception:
+                return float("nan")
 
     def load(self, mod, weight=1.0, video_weight=1.0, audio_weight=1.0, mods=None, strength=None, audio_strength=None):
         rows = list(mods) if mods is not None else []
